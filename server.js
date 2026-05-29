@@ -108,7 +108,8 @@ app.get('/api/admin/data', isAdmin, async (req, res) => {
     const activeDrivers = await Driver.countDocuments({ status: { $in: ['available', 'busy'] }, isApproved: true });
     const applicationsCount = await Driver.countDocuments({ isApproved: false });
     
-    const orders = await Order.find().populate('assignedDriver').sort({ createdAt: -1 });
+    // Sort orders so pending/assigned show up first
+    const orders = await Order.find().populate('assignedDriver').sort({ status: 1, createdAt: -1 });
     const drivers = await Driver.find({ isApproved: true });
     const applications = await Driver.find({ isApproved: false });
 
@@ -124,7 +125,7 @@ app.post('/api/admin/driver/:id/approve', isAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
-// Admin Actions: Toggle Driver Status
+// Admin Actions: Toggle Driver Status Manual Override
 app.post('/api/admin/driver/:id/toggle-status', isAdmin, async (req, res) => {
   const driver = await Driver.findById(req.params.id);
   driver.status = driver.status === 'offline' ? 'available' : 'offline';
@@ -132,7 +133,41 @@ app.post('/api/admin/driver/:id/toggle-status', isAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
-// --- FRONTEND HTML (Isolated to prevent escape character conflicts) ---
+// NEW ADMIN ACTION: Complete Order & Free the Driver!
+app.post('/api/admin/orders/:id/deliver', isAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    if (order.status === 'Assigned' && order.assignedDriver) {
+      // Free the driver up!
+      await Driver.findByIdAndUpdate(order.assignedDriver, { status: 'available' });
+    }
+
+    order.status = 'Delivered';
+    await order.save();
+
+    // Check if there are backlogged 'Pending' orders to auto-assign to this newly freed driver!
+    const backloggedOrder = await Order.findOne({ status: 'Pending' }).sort({ createdAt: 1 });
+    const freedDriver = await Driver.findOne({ status: 'available', isApproved: true });
+
+    if (backloggedOrder && freedDriver) {
+      backloggedOrder.status = 'Assigned';
+      backloggedOrder.assignedDriver = freedDriver._id;
+      await backloggedOrder.save();
+
+      freedDriver.status = 'busy';
+      await freedDriver.save();
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// --- FRONTEND HTML ---
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="en">
@@ -146,6 +181,7 @@ const htmlContent = `
 <body class="bg-gray-50 font-sans text-gray-800 antialiased min-h-screen flex flex-col">
 
   <div class="flex flex-1 overflow-hidden">
+    <!-- SIDEBAR -->
     <aside id="sidebar" class="w-64 bg-slate-900 text-white flex-shrink-0 hidden md:flex flex-col z-50 fixed md:relative h-full">
       <div class="p-5 bg-red-600 font-bold text-2xl flex items-center gap-3 tracking-wide">
         <i class="fa-solid fa-truck-fast"></i> RedDash
@@ -158,13 +194,16 @@ const htmlContent = `
       <div class="p-4 border-t border-gray-800 text-xs text-gray-500">© 2026 RedDash Inc.</div>
     </aside>
 
+    <!-- Main Workspace Area -->
     <div class="flex-1 flex flex-col min-w-0 overflow-y-auto">
+      <!-- MOBILE TOP BAR -->
       <header class="bg-white border-b p-4 flex items-center justify-between md:hidden shadow-sm">
         <span class="text-red-600 font-black text-xl tracking-tight"><i class="fa-solid fa-truck-fast"></i> RedDash</span>
         <button onclick="toggleSidebar()" class="text-gray-700 text-2xl focus:outline-none"><i class="fa-solid fa-bars"></i></button>
       </header>
 
       <main class="p-4 md:p-8 flex-1">
+        <!-- SECTION 1: HOME PAGE -->
         <section id="home-section" class="space-y-12">
           <div class="bg-gradient-to-r from-red-600 to-red-700 rounded-3xl p-6 md:p-12 text-white shadow-xl flex flex-col md:flex-row items-center justify-between gap-8">
             <div class="max-w-xl space-y-4">
@@ -198,6 +237,7 @@ const htmlContent = `
           </div>
         </section>
 
+        <!-- SECTION 2: APPLICATION FOR DRIVERS -->
         <section id="apply-section" class="hidden max-w-2xl mx-auto bg-white border shadow-xl rounded-2xl p-6 md:p-8">
           <div class="text-center mb-6">
             <div class="inline-block p-4 bg-red-50 text-red-600 rounded-full text-3xl mb-3"><i class="fa-solid fa-address-card"></i></div>
@@ -221,6 +261,7 @@ const htmlContent = `
           </form>
         </section>
 
+        <!-- SECTION 3: ADMIN CONSOLE -->
         <section id="admin-section" class="hidden space-y-8">
           <div id="adminAuthGate" class="max-w-md mx-auto bg-white border rounded-2xl shadow-xl p-6">
             <div class="text-center mb-4"><i class="fa-solid fa-shield-halved text-4xl text-red-600"></i></div>
@@ -268,7 +309,7 @@ const htmlContent = `
               </div>
               <div class="bg-white border rounded-xl p-4 shadow-sm">
                 <h3 class="text-lg font-bold border-b pb-2 mb-3 text-slate-800"><i class="fa-solid fa-map-location-dot"></i> Live Operational Log Ledger</h3>
-                <div class="overflow-x-auto"><table class="w-full text-left text-sm"><thead class="bg-gray-100 text-xs font-bold uppercase text-gray-600"><tr><th class="p-2">Client</th><th class="p-2">Parcel Data</th><th class="p-2">Tracking Node</th></tr></thead><tbody id="ordersTableBody"></tbody></table></div>
+                <div class="overflow-x-auto"><table class="w-full text-left text-sm"><thead class="bg-gray-100 text-xs font-bold uppercase text-gray-600"><tr><th class="p-2">Client</th><th class="p-2">Parcel Data</th><th class="p-2">Tracking Node</th><th class="p-2">Action</th></tr></thead><tbody id="ordersTableBody"></tbody></table></div>
               </div>
             </div>
           </div>
@@ -283,6 +324,7 @@ const htmlContent = `
       sidebar.classList.toggle('hidden');
     }
 
+    // Fixed dynamic layout routing
     function showSection(sectionId) {
       document.getElementById('home-section').classList.add('hidden');
       document.getElementById('apply-section').classList.add('hidden');
@@ -308,7 +350,7 @@ const htmlContent = `
       });
       const data = await res.json();
       if(data.success) {
-        alert(data.assigned ? 'Fantastic! Order logged and driver dispatched instantly.' : 'Order pinned to terminal backlog. Searching for next online driver...');
+        alert(data.assigned ? 'Fantastic! Order logged and driver dispatched instantly.' : 'Order pinned to backlog. No available drivers active right now.');
         document.getElementById('orderForm').reset();
       }
     }
@@ -397,6 +439,15 @@ const htmlContent = `
       const ordersBody = document.getElementById('ordersTableBody');
       ordersBody.innerHTML = data.orders.map(o => {
         const driverName = o.assignedDriver ? '⚡ ' + o.assignedDriver.name : '⚠️ Awaiting Fleet Availability';
+        
+        // Dynamic action button to resolve orders and clear driver queues
+        let actionButton = '';
+        if (o.status !== 'Delivered') {
+          actionButton = \`<button onclick="markAsDelivered('\${o._id}')" class="bg-slate-900 text-white text-[10px] px-2 py-1 rounded font-bold hover:bg-red-600 transition">Complete</button>\`;
+        } else {
+          actionButton = \`<span class="text-green-600 font-bold text-xs"><i class="fa-solid fa-circle-check"></i> Done</span>\`;
+        }
+
         return \`
           <tr class="border-b text-xs">
             <td class="p-2 font-semibold text-slate-800">\${o.customerName}<p class="text-gray-400 text-[10px] font-normal">\${o.deliveryAddress}</p></td>
@@ -404,6 +455,9 @@ const htmlContent = `
             <td class="p-2">
               <span class="block font-bold text-slate-700">\${o.status}</span>
               <span class="text-[10px] text-gray-500">\${driverName}</span>
+            </td>
+            <td class="p-2">
+              \${actionButton}
             </td>
           </tr>
         \`;
@@ -418,6 +472,14 @@ const htmlContent = `
     async function toggleDriverStatus(id) {
       await fetch('/api/admin/driver/' + id + '/toggle-status', { method: 'POST' });
       loadAdminDashboard();
+    }
+
+    // Call the resolution API routing point
+    async function markAsDelivered(orderId) {
+      const res = await fetch('/api/admin/orders/' + orderId + '/deliver', { method: 'POST' });
+      if (res.ok) {
+        loadAdminDashboard();
+      }
     }
   </script>
 </body>
